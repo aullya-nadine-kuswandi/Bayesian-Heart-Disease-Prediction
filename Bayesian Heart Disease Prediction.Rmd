@@ -1,0 +1,826 @@
+---
+title: "Bayesian Logistic Regression for Heart Disease Prediction"
+date: "2025-12-05"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(rjags)
+library(caret)
+library(loo)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ROCR)
+```
+
+
+```{r}
+df <- read.csv("heart-disease.csv")
+head(df)
+```
+
+```{r}
+str(df)
+```
+
+
+```{r}
+# Check Distribution of Target Column (target variable for classification)
+table(df$target)
+```
+
+```{r}
+# The proportion of the positive class (class 1) in target column is used as the probability threshold for class prediction
+P1 = (165/(165+138))
+P1
+```
+
+```{r}
+#Split Dataset -> Train (80%) and test (20%)
+set.seed(123)
+idx <- createDataPartition(df$thal, p = 0.8, list = FALSE)
+
+train <- df[idx,]
+test <- df[-idx,]
+```
+
+```{r}
+robust_params <- function(x){
+  list(
+    med = median(x, na.rm = TRUE),
+    iqr = IQR(x, na.rm = TRUE)
+  )
+}
+
+num_cols <- c("age", "trestbps", "chol", "thalach", "oldpeak")
+params <- lapply(train[num_cols], robust_params)
+
+robust_scale_with_params <- function(x, p){
+  (x - p$med) / p$iqr
+}
+
+for(col in num_cols){
+  train[[col]] <- robust_scale_with_params(train[[col]], params[[col]])
+}
+
+for(col in num_cols){
+  test[[col]] <- robust_scale_with_params(test[[col]], params[[col]])
+}
+
+
+x_train <- model.matrix(~ ., data = train[-14])
+x_test  <- model.matrix(~ ., data = test[-14])
+
+y_train <- train$target
+y_test  <- test$target
+
+n <- nrow(x_train)
+p <- ncol(x_train)
+
+```
+
+## Bayesian Logistic Regression Model 1
+```{r}
+# Model Bayesian Logistic Regression 1
+bayes_model1 <- textConnection("model{ 
+            # Likelihood
+            for(i in 1:n){ 
+                  Y[i] ~ dbern(pi[i]) 
+                  logit(pi[i]) <- inprod(beta[], X[i, ])
+                  
+                  # Posterior Predictive Samples
+                  Y2[i] ~ dbern(pi[i])
+                  
+                  log_lik[i] <- logdensity.bern(Y[i], pi[i])
+            } 
+            
+            
+            # Priors for Regression Coefficients 
+            for(j in 1:p){
+                beta[j] ~ dnorm(0,0.5)
+            } 
+            
+}")
+
+data1 <- list(Y = y_train, X = x_train, n = n, p = p)
+burn1 <- 10000
+iter1 <- 50000
+
+model1 <- jags.model(bayes_model1, data = data1, n.chains = 3)
+update(model1, burn1)
+samp1 <- coda.samples(model1, variable.names = c("beta", "pi", "Y2", "log_lik"), n.iter = iter1, n.thin = 5)
+```
+
+```{r}
+beta_samp <- samp1[, grep("beta", colnames(samp1[[1]]))]
+summary(beta_samp)
+```
+
+## Visualization
+```{r}
+var_names <- c(
+  "Intercept",
+  colnames(x_train)[-1]
+)
+mb <- as.matrix(beta_samp)
+
+for (k in seq_along(colnames(mb))) {
+
+  param <- colnames(mb)[k]        
+  label <- var_names[k]          
+  
+  df <- data.frame(value = mb[, k])
+  
+  # 95% credible interval
+  ci <- quantile(df$value, probs = c(0.025, 0.975))
+  lower <- ci[1]
+  upper <- ci[2]
+
+
+  # density estimation
+  dens <- density(df$value)
+  dens_df <- data.frame(x = dens$x, y = dens$y)
+  
+  # CI shading region only
+  dens_ci <- subset(dens_df, x >= lower & x <= upper)
+
+  p <- ggplot() +
+    # full density curve outline
+    geom_line(data = dens_df, aes(x, y), color = "black", size = 1) +
+    # shaded CI only
+    geom_area(data = dens_ci, aes(x, y), fill = "skyblue", alpha = 0.4) +
+    # posterior mean (red dashed)
+    geom_vline(xintercept = mean(df$value),
+               linetype = "dashed", color = "red") +
+    
+    labs(
+      title = paste0("Posterior Density of ", label, " (", param, ")"),
+      subtitle = paste0("95% CI: [", round(lower,3), ", ", round(upper,3), "]"),
+      x = param, y = "Density"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+
+```{r}
+par(mar = c(4, 4, 2, 2))
+plot(beta_samp)
+```
+
+
+```{r}
+# Gelman-Rubin diagnostic (multivariate psrf > 1.1 suggest poor convergence)
+gelman.diag(beta_samp)
+```
+All PSRF (Potential Scale Reduction Factor) values for the parameters are below 1.1, and the multivariate PSRF is 1, which is also under the commonly used threshold of 1.1. These results indicate that the MCMC chains have likely converged to the target posterior distribution.
+
+## Model Evaluation
+### Posterior Predictive Check
+```{r}
+m_ppc <- do.call(rbind, lapply(samp1, as.matrix))
+
+beta_cols <- grep("^beta\\[", colnames(m_ppc))
+y2_cols   <- grep("^Y2\\[",   colnames(m_ppc))
+
+beta_mat  <- m_ppc[, beta_cols, drop = FALSE]
+y2_mat    <- m_ppc[, y2_cols,   drop = FALSE]
+
+logits_post <- x_train %*% t(beta_mat)
+p_post <- plogis(logits_post)
+p_mean <- rowMeans(p_post)
+
+plot_data <- data.frame(
+  Observed = y_train,
+  Prob     = as.numeric(p_mean)
+)
+
+plot_data$Bin <- cut(
+  plot_data$Prob,
+  breaks = quantile(plot_data$Prob, probs = seq(0, 1, 0.1)),
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+obs_props <- plot_data %>%
+  group_by(Bin) %>%
+  summarise(Proportion = mean(Observed), .groups = "drop") %>%
+  mutate(Type = "Observed")
+
+sample_indices <- 1:nrow(y2_mat)
+n_draws <- length(sample_indices)
+
+ppc_list <- vector("list", n_draws)
+
+for(i in sample_indices) {
+
+  y_sim <- y2_mat[i, ]
+
+  tmp_df <- data.frame(
+    Bin = plot_data$Bin,
+    Simulated = y_sim
+  )
+
+  sim_summary <- tmp_df %>%
+    group_by(Bin) %>%
+    summarise(Proportion = mean(Simulated), .groups = "drop") %>%
+    mutate(Iter = i)
+
+  ppc_list[[i]] <- sim_summary
+}
+
+ppc_data <- do.call(rbind, ppc_list)
+
+ppc_mean <- ppc_data %>%
+  group_by(Bin) %>%
+  summarise(Proportion = mean(Proportion), .groups = 'drop')
+
+ggplot() +
+  geom_line(data = ppc_data,
+            aes(x = Bin, y = Proportion, group = Iter),
+            color = "blue", alpha = 0.01) +
+
+  geom_line(data = ppc_mean,
+            aes(x = Bin, y = Proportion),
+            color = "orange", linetype = "dashed", size = 1.2) +
+  geom_point(data = ppc_mean,
+             aes(x = Bin, y = Proportion),
+             color = "orange", shape = 17, size = 3) +
+
+  geom_line(data = obs_props,
+            aes(x = Bin, y = Proportion),
+            color = "red", size = 1.2) +
+  geom_point(data = obs_props,
+             aes(x = Bin, y = Proportion),
+             color = "red", size = 3) +
+
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "PPC",
+    x = "Bin Index",
+    y = "Proportion"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.1, face = "bold", size = 14))
+```
+
+
+
+### Model Fit Statistic
+#### DIC
+```{r}
+dic1 <- dic.samples(model1, n.iter = iter1, n.thin = 5, progress.bar = "none")
+dic1
+```
+
+#### LOO
+```{r}
+m <- as.matrix(samp1)
+log_lik_mat <- m[, grep("^log_lik\\[", colnames(m))]
+dim(log_lik_mat)
+```
+
+```{r}
+s <- nrow(log_lik_mat)
+chain_id <- rep(1:3, each = s / 3)
+
+r_eff   <- relative_eff(exp(log_lik_mat), chain_id = chain_id)
+loo1 <- loo(log_lik_mat, r_eff = r_eff)
+loo1
+```
+
+
+#### WAIC
+```{r}
+waic1 <- waic(log_lik_mat)
+waic1
+```
+
+
+```{r}
+get_eval_metrics <- function(y_true, y_pred, type) {
+  TP <- sum(y_pred == 1 & y_true == 1)
+  FP <- sum(y_pred == 1 & y_true == 0)
+  TN <- sum(y_pred == 0 & y_true == 0)
+  FN <- sum(y_pred == 0 & y_true == 1)
+  
+  accuracy  <- (TP + TN) / (TP + TN + FP + FN)
+  precision <- TP / (TP + FP)
+  recall    <- TP / (TP + FN)  
+  f1_score  <- 2 * (precision * recall) / (precision + recall)
+  
+  if(is.nan(precision)) precision <- 0
+  if(is.nan(f1_score)) f1_score <- 0
+  
+  cat(paste0("\n", type, ":\n"))
+  cat(paste("Accuracy: ", round(accuracy, 4), "\n"))
+  cat(paste("Precision:", round(precision, 4), "\n"))
+  cat(paste("Recall:   ", round(recall, 4), "\n"))
+  cat(paste("F1 Score: ", round(f1_score, 4), "\n"))
+  
+  return(list(
+    accuracy  = accuracy,
+    precision = precision,
+    recall    = recall,
+    f1_score  = f1_score
+  ))
+}
+```
+
+```{r}
+pi_post <- as.matrix(samp1)[ , grep("^pi\\[", colnames(as.matrix(samp1))) ]
+p_train_mean <- colMeans(pi_post)
+y_pred_train <- ifelse(p_train_mean > 0.5445545, 1, 0) #perhitungan 0.5445545 terdapat di bagian atas (P1 = 0.5445545)
+
+metric_train <- get_eval_metrics(y_true = y_train, y_pred = y_pred_train, "Bayesian Model 1 (Train)")
+
+```
+
+```{r}
+beta_mat <- as.matrix(beta_samp)
+beta_hat <- colMeans(beta_mat)   
+
+logits_test <- x_test %*% beta_hat
+p_test_mean <- 1 / (1 + exp(-logits_test))
+y_pred_test <- ifelse(p_test_mean > 0.5445545, 1, 0)
+
+metric_test <- get_eval_metrics(y_true = y_test, y_pred = y_pred_test, "Bayesian Model 1 (Test)")
+
+```
+
+
+```{r}
+m_roc <- do.call(rbind, lapply(samp1, as.matrix))
+
+beta_cols <- grep("^beta\\[", colnames(m_roc))
+
+beta_mat  <- m_roc[, beta_cols, drop = FALSE]
+
+logits_post <- x_test %*% t(beta_mat)
+p_post <- plogis(logits_post)
+p_mean <- rowMeans(p_post)
+
+bayes_prob1 <- p_mean
+
+pred_ob1 <- prediction(bayes_prob1, y_test)
+
+roc_perf1 <- performance(pred_ob1, measure = "tpr", x.measure = "fpr")
+
+roc_auc_obj1 <- performance(pred_ob1, measure = "auc")
+roc_auc_val1 <- unlist(roc_auc_obj1@y.values)
+
+pr_perf1 <- performance(pred_ob1, measure = "prec", x.measure = "rec")
+
+recall_vals1 <- pr_perf1@x.values[[1]]
+precision_vals1 <- pr_perf1@y.values[[1]]
+
+precision_vals1[is.nan(precision_vals1)] <- 1
+
+id1 <- order(recall_vals1)
+pr_auc_val1 <- sum(
+  diff(recall_vals1[id1]) *
+    (precision_vals1[id1][-1] + precision_vals1[id1][-length(precision_vals1)]) / 2
+)
+
+plot(roc_perf1, col = "blue", lwd = 2, main = "")
+title(
+  main = paste("Bayesian ROC Curve 1 (AUC =", round(roc_auc_val1, 2), ")"),
+  line = 2
+)
+
+plot(pr_perf1, col = "blue", lwd = 2, main = "", ylim = c(0, 1))
+title(
+  main = paste("Bayesian PR Curve 1 (AUC =", round(pr_auc_val1, 2), ")"),
+  line = 2
+)
+```
+
+## Bayesian Logistic Regression Model 2
+```{r}
+x_train <- model.matrix(~ ., data = train[-14])
+x_test  <- model.matrix(~ ., data = test[-14])
+
+y_train <- train$target
+y_test  <- test$target
+
+n <- nrow(x_train)
+p <- ncol(x_train)
+```
+
+
+```{r}
+bayes_model2 <- textConnection("model{ 
+            # Likelihood
+            for(i in 1:n){ 
+                  Y[i] ~ dbern(pi[i]) 
+                  logit(pi[i]) <- inprod(beta[], X[i, ])
+                  
+                  # Posterior Predictive Samples
+                  Y2[i] ~ dbern(pi[i])
+                  
+                  log_lik[i] <- logdensity.bern(Y[i], pi[i])
+            } 
+            
+            
+            # Priors for Regression Coefficients 
+            for(j in 1:p){
+                beta[j] ~ dnorm(0,1)
+            } 
+            
+}")
+
+data2 <- list(Y = y_train, X = x_train, n = n, p = p)
+burn2 <- 10000
+iter2 <- 50000
+
+model2 <- jags.model(bayes_model2, data = data2, n.chains = 3)
+update(model2, burn2)
+samp2 <- coda.samples(model2, variable.names = c("beta", "pi", "Y2", "log_lik"), n.iter = iter2, n.thin = 5)
+```
+
+```{r}
+beta_samp2 <- samp2[, grep("beta", colnames(samp2[[1]]))]
+summary(beta_samp2)
+```
+
+```{r}
+var_names <- c(
+  "Intercept",
+  colnames(x_train)[-1]
+)
+mb2 <- as.matrix(beta_samp2)
+
+for (k in seq_along(colnames(mb2))) {
+
+  param <- colnames(mb2)[k]        
+  label <- var_names[k]          
+  
+  df <- data.frame(value = mb2[, k])
+  
+  # 95% credible interval
+  ci <- quantile(df$value, probs = c(0.025, 0.975))
+  lower <- ci[1]
+  upper <- ci[2]
+
+
+  # density estimation
+  dens <- density(df$value)
+  dens_df <- data.frame(x = dens$x, y = dens$y)
+  
+  # CI shading region only
+  dens_ci <- subset(dens_df, x >= lower & x <= upper)
+
+  p <- ggplot() +
+    # full density curve outline
+    geom_line(data = dens_df, aes(x, y), color = "black", size = 1) +
+    # shaded CI only
+    geom_area(data = dens_ci, aes(x, y), fill = "skyblue", alpha = 0.4) +
+    # posterior mean (red dashed)
+    geom_vline(xintercept = mean(df$value),
+               linetype = "dashed", color = "red") +
+    
+    labs(
+      title = paste0("Posterior Density of ", label, " (", param, ")"),
+      subtitle = paste0("95% CI: [", round(lower,3), ", ", round(upper,3), "]"),
+      x = param, y = "Density"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+```
+
+
+
+```{r}
+par(mar = c(4, 4, 2, 2))
+plot(beta_samp2)
+```
+
+```{r}
+# Gelman-Rubin diagnostic (multivariate psrf > 1.1 suggest poor convergence)
+gelman.diag(beta_samp2)
+```
+All PSRF (Potential Scale Reduction Factor) values for the parameters are below 1.1, and the multivariate PSRF is 1, which is also under the commonly used threshold of 1.1. These results indicate that the MCMC chains have likely converged to the target posterior distribution.
+
+## Model Evaluation
+### Posterior Predictive Check
+```{r}
+m_ppc2 <- do.call(rbind, lapply(samp2, as.matrix))
+
+beta_cols2 <- grep("^beta\\[", colnames(m_ppc2))
+y2_cols2 <- grep("^Y2\\[",   colnames(m_ppc2))
+
+beta_mat2  <- m_ppc2[, beta_cols2, drop = FALSE]
+y2_mat2  <- m_ppc2[, y2_cols2,   drop = FALSE]
+
+logits_post2 <- x_train %*% t(beta_mat2)
+p_post2 <- plogis(logits_post2)
+p_mean2 <- rowMeans(p_post2)
+
+plot_data2 <- data.frame(
+  Observed = y_train,
+  Prob     = as.numeric(p_mean2)
+)
+
+plot_data2$Bin <- cut(
+  plot_data2$Prob,
+  breaks = quantile(plot_data2$Prob, probs = seq(0, 1, 0.1)),
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+obs_props2 <- plot_data2 %>%
+  group_by(Bin) %>%
+  summarise(Proportion = mean(Observed), .groups = "drop") %>%
+  mutate(Type = "Observed")
+
+sample_indices2 <- 1:nrow(y2_mat2)
+n_draws2 <- length(sample_indices2)
+
+ppc_list2 <- vector("list", n_draws2)
+
+for(i in sample_indices2) {
+
+  y_sim <- y2_mat2[i, ]
+
+  tmp_df <- data.frame(
+    Bin = plot_data2$Bin,
+    Simulated = y_sim
+  )
+
+  sim_summary <- tmp_df %>%
+    group_by(Bin) %>%
+    summarise(Proportion = mean(Simulated), .groups = "drop") %>%
+    mutate(Iter = i)
+
+  ppc_list2[[i]] <- sim_summary
+}
+
+ppc_data2 <- do.call(rbind, ppc_list2)
+
+ppc_mean2 <- ppc_data2 %>%
+  group_by(Bin) %>%
+  summarise(Proportion = mean(Proportion), .groups = 'drop')
+
+ggplot() +
+  geom_line(data = ppc_data2,
+            aes(x = Bin, y = Proportion, group = Iter),
+            color = "blue", alpha = 0.01) +
+
+  # Mean simulated (orange dashed line)
+  geom_line(data = ppc_mean2,
+            aes(x = Bin, y = Proportion),
+            color = "orange", linetype = "dashed", size = 1.2) +
+  geom_point(data = ppc_mean2,
+             aes(x = Bin, y = Proportion),
+             color = "orange", shape = 17, size = 3) +
+
+  # Observed data (red line)
+  geom_line(data = obs_props2,
+            aes(x = Bin, y = Proportion),
+            color = "red", size = 1.2) +
+  geom_point(data = obs_props2,
+             aes(x = Bin, y = Proportion),
+             color = "red", size = 3) +
+
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "PPC",
+    x = "Bin Index",
+    y = "Proportion"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.1, face = "bold", size = 14))
+```
+
+### Model Fit Statistic
+#### DIC
+```{r}
+dic2 <- dic.samples(model2, n.iter = iter2, n.thin = 5, progress.bar = "none")
+dic2
+```
+
+#### LOO
+```{r}
+m2 <- as.matrix(samp2)
+log_lik_mat2 <- m2[, grep("^log_lik\\[", colnames(m2))]
+dim(log_lik_mat2)
+```
+
+```{r}
+s2 <- nrow(log_lik_mat2)
+chain_id2 <- rep(1:3, each = s2 / 3)
+
+r_eff2   <- relative_eff(exp(log_lik_mat2), chain_id = chain_id2)
+loo2 <- loo(log_lik_mat2, r_eff = r_eff2)
+loo2
+```
+
+
+#### WAIC
+```{r}
+waic2 <- waic(log_lik_mat2)
+waic2
+```
+
+
+```{r}
+get_eval_metrics <- function(y_true, y_pred, type) {
+  TP <- sum(y_pred == 1 & y_true == 1)
+  FP <- sum(y_pred == 1 & y_true == 0)
+  TN <- sum(y_pred == 0 & y_true == 0)
+  FN <- sum(y_pred == 0 & y_true == 1)
+  
+  accuracy  <- (TP + TN) / (TP + TN + FP + FN)
+  precision <- TP / (TP + FP)
+  recall    <- TP / (TP + FN)  
+  f1_score  <- 2 * (precision * recall) / (precision + recall)
+  
+  if(is.nan(precision)) precision <- 0
+  if(is.nan(f1_score)) f1_score <- 0
+  
+  cat(paste0("\n", type, ":\n"))
+  cat(paste("Accuracy: ", round(accuracy, 4), "\n"))
+  cat(paste("Precision:", round(precision, 4), "\n"))
+  cat(paste("Recall:   ", round(recall, 4), "\n"))
+  cat(paste("F1 Score: ", round(f1_score, 4), "\n"))
+  
+  return(list(
+    accuracy  = accuracy,
+    precision = precision,
+    recall    = recall,
+    f1_score  = f1_score
+  ))
+}
+```
+
+```{r}
+pi_post2 <- as.matrix(samp2)[ , grep("^pi\\[", colnames(as.matrix(samp2))) ]
+
+p_train_mean2 <- colMeans(pi_post2)
+
+y_pred_train2 <- ifelse(p_train_mean2 > 0.5445545, 1, 0)
+
+metric_train2 <- get_eval_metrics(y_true = y_train, y_pred = y_pred_train2, "Bayesian Model 2 (Train)")
+
+
+```
+
+```{r}
+beta_mat2 <- as.matrix(beta_samp2)
+beta_hat2 <- colMeans(beta_mat2)   
+
+logits_test2 <- x_test %*% beta_hat2
+p_test_mean2 <- 1 / (1 + exp(-logits_test2))
+
+y_pred_test2 <- ifelse(p_test_mean2 > 0.5445545, 1, 0)
+
+metric_test2 <- get_eval_metrics(y_true = y_test, y_pred = y_pred_test2, "Bayesian Model 2 (Test)")
+
+```
+
+```{r}
+m_roc2 <- do.call(rbind, lapply(samp2, as.matrix))
+
+beta_cols2 <- grep("^beta\\[", colnames(m_roc2))
+
+beta_mat2 <- m_roc2[, beta_cols2, drop = FALSE]
+
+logits_post2 <- x_test %*% t(beta_mat2)
+p_post2 <- plogis(logits_post2)
+p_mean2 <- rowMeans(p_post2)
+
+bayes_prob2 <- p_mean2
+
+pred_ob2 <- prediction(bayes_prob2, y_test)
+
+roc_perf2 <- performance(pred_ob2, measure = "tpr", x.measure = "fpr")
+
+roc_auc_obj2 <- performance(pred_ob2, measure = "auc")
+roc_auc_val2 <- unlist(roc_auc_obj2@y.values)
+
+pr_perf2 <- performance(pred_ob2, measure = "prec", x.measure = "rec")
+
+recall_vals2 <- pr_perf2@x.values[[1]]
+precision_vals2 <- pr_perf2@y.values[[1]]
+
+precision_vals2[is.nan(precision_vals2)] <- 1
+
+id2 <- order(recall_vals2)
+pr_auc_val2 <- sum(
+  diff(recall_vals2[id2]) *
+    (precision_vals2[id2][-1] + precision_vals2[id2][-length(precision_vals2)]) / 2
+)
+
+plot(roc_perf2, col = "blue", lwd = 2, main = "")
+title(
+  main = paste("Bayesian ROC Curve 2 (AUC =", round(roc_auc_val2, 2), ")"),
+  line = 2
+)
+
+plot(pr_perf2, col = "blue", lwd = 2, main = "", ylim = c(0, 1))
+title(
+  main = paste("Bayesian PR Curve 2 (AUC =", round(pr_auc_val2, 2), ")"),
+  line = 2
+)
+```
+
+
+## Frequentist Logistic Regression
+```{r}
+model_glm <- glm(
+  target ~ .,
+  data = train,
+  family = binomial(link = "logit")
+)
+
+summary(model_glm)
+```
+
+```{r}
+glm_prob <- predict(model_glm, newdata = test, type = "response")
+glm_pred <- ifelse(glm_prob > 0.5445545, 1, 0)
+metric_glm <- get_eval_metrics(y_test, glm_pred, "Frequentist (test)")
+```
+
+```{r}
+pred_ob <- prediction(glm_prob, y_test)
+
+roc_perf <- performance(pred_ob, measure = "tpr", x.measure = "fpr")
+
+roc_auc_obj <- performance(pred_ob, measure = "auc")
+roc_auc_val <- unlist(roc_auc_obj@y.values)
+
+pr_perf <- performance(pred_ob, measure = "prec", x.measure = "rec")
+
+recall_vals <- pr_perf@x.values[[1]]
+precision_vals <- pr_perf@y.values[[1]]
+
+precision_vals[is.nan(precision_vals)] <- 1
+
+id <- order(recall_vals)
+pr_auc_val <- sum(
+  diff(recall_vals[id]) *
+    (precision_vals[id][-1] + precision_vals[id][-length(precision_vals)]) / 2
+)
+
+plot(roc_perf, col = "blue", lwd = 2, main = "")
+title(
+  main = paste("Frequentist ROC Curve (AUC =", round(roc_auc_val, 2), ")"),
+  line = 2
+)
+
+plot(pr_perf, col = "blue", lwd = 2, main = "", ylim = c(0, 1))
+title(
+  main = paste("Frequentist PR Curve (AUC =", round(pr_auc_val, 2), ")"),
+  line = 2
+)
+```
+
+```{r}
+results_table <- data.frame(
+  Model = c("Bayesian Model 1 [Normal(0, 0.5)]",
+            "Bayesian Model 2 [Normal(0, 1)]",
+            "Frequentist"),
+  
+  Accuracy  = c(metric_test$accuracy,
+                metric_test2$accuracy,
+                metric_glm$accuracy),
+  
+  Precision = c(metric_test$precision,
+                metric_test2$precision,
+                metric_glm$precision),
+  
+  Recall    = c(metric_test$recall,
+                metric_test2$recall,
+                metric_glm$recall),
+  
+  F1        = c(metric_test$f1_score,
+                metric_test2$f1_score,
+                metric_glm$f1_score),
+  
+  ROC       = c(roc_auc_val1, 
+                roc_auc_val2, 
+                roc_auc_val),
+  
+  PR        = c(pr_auc_val,
+                pr_auc_val1,
+                pr_auc_val2)
+)
+
+results_table[,-1] <- round(results_table[,-1], 4)
+results_table
+
+```
+
